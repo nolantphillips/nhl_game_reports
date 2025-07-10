@@ -1,2 +1,6 @@
 pandas
 nhl-api-py
+joblib
+dotenv
+scikit-learn
+xgboost
