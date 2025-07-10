@@ -1,6 +1,7 @@
 import pandas as pd
 from nhlpy import NHLClient
 import numpy as np
+from collections import defaultdict
 
 
 def time_remaining(start_time_str, end_time_str):
@@ -1061,13 +1062,14 @@ def get_processed_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_on_ice_players(shot_row, shifts_df):
     time = shot_row["game_seconds"]
-    players_on_ice = shifts_df[
-        (shifts_df["start_total_seconds"] <= time)
-        & (shifts_df["end_total_seconds"] >= time)
+    shifts_copy = shifts_df.copy()
+    players_on_ice = shifts_copy[
+        (shifts_copy["start_total_seconds"] <= time)
+        & (shifts_copy["end_total_seconds"] >= time)
     ]
 
-    home_id = shifts_df["home_id"].iloc[0]
-    away_id = shifts_df["away_id"].iloc[0]
+    home_id = shifts_copy["home_id"].iloc[0]
+    away_id = shifts_copy["away_id"].iloc[0]
 
     home_players = players_on_ice[players_on_ice["shift_team"] == home_id][
         "player_id"
@@ -1082,6 +1084,7 @@ def get_on_ice_players(shot_row, shifts_df):
 def add_skaters_on_ice(
     processed_df: pd.DataFrame, time_df: pd.DataFrame, shifts_df: pd.DataFrame
 ) -> pd.DataFrame:
+    shifts_copy = shifts_df.copy()
     final_df = processed_df.copy()
     final_df[["period", "time"]] = time_df
     final_df["time_seconds"] = final_df["time"].apply(time_to_seconds)
@@ -1089,23 +1092,100 @@ def add_skaters_on_ice(
         "time_seconds"
     ]
 
-    shifts_df["start_seconds"] = shifts_df["start_time"].apply(time_to_seconds)
-    shifts_df["end_seconds"] = shifts_df["end_time"].apply(time_to_seconds)
-    shifts_df["start_total_seconds"] = (shifts_df["period"] - 1) * 1200 + shifts_df[
+    shifts_copy["start_seconds"] = shifts_copy["start_time"].apply(time_to_seconds)
+    shifts_copy["end_seconds"] = shifts_copy["end_time"].apply(time_to_seconds)
+    shifts_copy["start_total_seconds"] = (shifts_copy["period"] - 1) * 1200 + shifts_copy[
         "start_seconds"
     ]
-    shifts_df["end_total_seconds"] = (shifts_df["period"] - 1) * 1200 + shifts_df[
+    shifts_copy["end_total_seconds"] = (shifts_copy["period"] - 1) * 1200 + shifts_copy[
         "end_seconds"
     ]
 
     final_df[["home_players", "away_players"]] = final_df.apply(
-        lambda row: get_on_ice_players(row, shifts_df), axis=1
+        lambda row: get_on_ice_players(row, shifts_copy), axis=1
     )
 
     return final_df
 
+def get_toi_df(shifts_df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
+    player_dict = dict(zip(players_df["player_id"].to_list(), players_df["name"].to_list()))
+    new_shifts = shifts_df.copy()
+    names = []
 
-def get_corsi_df(
-    shots_df: pd.DataFrame, misses_df: pd.DataFrame, blocks_df: pd.DataFrame
+    for id in new_shifts["player_id"].to_list():
+        name = player_dict[id]
+        names.append(name)
+    new_shifts["name"] = names
+    new_shifts["duration"] = new_shifts["duration"].fillna("00:00")
+    new_shifts["duration"] = new_shifts["duration"].apply(time_to_seconds)
+    toi_df = new_shifts.groupby(["name", "period"])["duration"].sum()
+    toi_df = toi_df.to_frame().reset_index(drop=True)
+    toi_df["duration_min"] = toi_df["duration"].apply(seconds_to_time)
+    
+    return toi_df
+
+def get_attempts_df(
+    shots_df: pd.DataFrame, misses_df: pd.DataFrame, blocks_df: pd.DataFrame, goals_df: pd.DataFrame
 ) -> pd.DataFrame:
+    attempts_df = shots_df[["home_skaters", "away_skaters", "event_owner", "period", "time", "play_type", "shooter_id"]]
+    attempts_df = pd.concat([attempts_df, misses_df[["home_skaters", "away_skaters", "event_owner", "period", "time", "play_type", "shooter_id"]]], axis=0)
+    attempts_df = pd.concat([attempts_df, blocks_df[["home_skaters", "away_skaters", "event_owner", "period", "time", "play_type", "shooter_id"]]], axis=0)
+    attempts_df = pd.concat([attempts_df, goals_df[["home_skaters", "away_skaters", "event_owner", "period", "time", "play_type", "shooter_id"]]], axis=0)
+    attempts_df = attempts_df.sort_values(["period", "time"], ascending=[True, False]).reset_index(drop=True)
+    return attempts_df
+
+def get_corsi_df(attempts_df: pd.DataFrame, shifts_df: pd.DataFrame) -> pd.DataFrame:
+    corsi_df = attempts_df.copy()
+    shifts_copy = shifts_df.copy()
+
+    shifts_copy["start_seconds"] = shifts_copy["start_time"].apply(time_to_seconds)
+    shifts_copy["end_seconds"] = shifts_copy["end_time"].apply(time_to_seconds)
+    shifts_copy["start_total_seconds"] = (shifts_copy["period"] - 1) * 1200 + shifts_copy[
+        "start_seconds"
+    ]
+    shifts_copy["end_total_seconds"] = (shifts_copy["period"] - 1) * 1200 + shifts_copy[
+        "end_seconds"
+    ]
+
+    corsi_df["tr_seconds"] = corsi_df["time"].apply(time_to_seconds)
+    corsi_df["time_seconds"] = 1200 - corsi_df["tr_seconds"]
+    corsi_df["game_seconds"] = (corsi_df["period"] - 1) * 1200 + corsi_df["time_seconds"]
+    corsi_df[["home_players", "away_players"]] = corsi_df.apply(
+        lambda row: get_on_ice_players(row, shifts_copy), axis=1
+    )
+
     return corsi_df
+
+def tally_corsi(corsi_df, players_df, game_id):
+    client = NHLClient()
+
+    pbp = client.game_center.play_by_play(game_id=game_id)
+    home_id = pbp["homeTeam"]["id"]
+
+    corsi_for = defaultdict(int)
+    corsi_against = defaultdict(int)
+
+    for _, row in corsi_df.iterrows():
+        period = row["period"]
+        if row["event_owner"] == home_id:
+            for player in row["home_players"]:
+                corsi_for[(player, period)] += 1
+            for player in row["away_players"]:
+                corsi_against[(player, period)] += 1
+        else:
+            for player in row["away_players"]:
+                corsi_for[(player, period)] += 1
+            for player in row["home_players"]:
+                corsi_against[(player, period)] += 1
+
+    all_keys = set(corsi_for.keys()) | set(corsi_against.keys())
+    data = [
+        {
+        "player_id": player,
+        "period": period,
+        "corsi_for": corsi_for.get((player, period), 0),
+        "corsi_against": corsi_against.get((player, period), 0)}
+        for (player, period) in all_keys
+    ]
+
+    return pd.merge(pd.DataFrame(data), players_df, on="player_id", how="left").sort_values(by=["name", "period"], ascending=[True, True]).reset_index(drop=True)
