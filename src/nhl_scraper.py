@@ -1114,21 +1114,24 @@ def add_skaters_on_ice(
 
     return final_df
 
-def get_toi_df(shifts_df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
-    player_dict = dict(zip(players_df["player_id"].to_list(), players_df["name"].to_list()))
-    new_shifts = shifts_df.copy()
-    names = []
+def get_toi_df(shifts_df: pd.DataFrame, players_df: pd.DataFrame, teams_df: pd.DataFrame) -> pd.DataFrame:
+    players_info = pd.merge(
+        players_df[["player_id", "name", "team"]],  # assuming 'team' here is team_id
+        teams_df[["team_id", "name"]],
+        left_on="team",
+        right_on="team_id",
+        how="left"
+    ).rename(columns={"name_x": "name", "name_y": "team_abbr"})
 
-    for id in new_shifts["player_id"].to_list():
-        name = player_dict[id]
-        names.append(name)
-    new_shifts["name"] = names
+    new_shifts = pd.merge(shifts_df, players_info, on="player_id", how="left")
+
     new_shifts["duration"] = new_shifts["duration"].fillna("00:00")
     new_shifts["duration"] = new_shifts["duration"].apply(time_to_seconds)
-    toi_df = new_shifts.groupby(["name", "period"])["duration"].sum()
-    toi_df = toi_df.to_frame().reset_index()
+
+    toi_df = new_shifts.groupby(["name", "team_abbr", "period"])["duration"].sum().reset_index()
+
     toi_df["duration_min"] = toi_df["duration"].apply(seconds_to_time)
-    
+
     return toi_df
 
 def get_attempts_df(
@@ -1409,7 +1412,7 @@ def get_and_save_data_for_tableau(game_id):
     final_df.to_csv(os.path.join(DATA_DIR, f"{game_id}_shot_info.csv"), index=False)
     print("Saved shot_info.csv!")
 
-    toi_df = get_toi_df(shifts_df=shifts_df, players_df=players_df)
+    toi_df = get_toi_df(shifts_df=shifts_df, players_df=players_df, teams_df=teams_df)
     toi_df.to_csv(os.path.join(DATA_DIR, f"{game_id}_toi_info.csv"), index=False)
     print("Saved toi_info.csv!")
 
