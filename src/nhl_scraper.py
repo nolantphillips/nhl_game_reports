@@ -6,6 +6,7 @@ import numpy as np
 from collections import defaultdict
 import itertools
 import joblib
+import shutil
 
 from src.config import MODELS_DIR
 from src.config import DATA_DIR
@@ -293,7 +294,7 @@ def nhl_scraper(game_ids: list):
                 if (
                     (pbp["plays"][idx - 1]["typeDescKey"] in ["takeaway", "giveaway"])
                     and time_diff <= 4
-                    and pbp[idx - 1]["details"]["zoneCode"] in ["N", "D"]
+                    and pbp["plays"][idx - 1]["details"]["zoneCode"] in ["N", "D"]
                 ):
                     rush = 1
 
@@ -496,14 +497,15 @@ def nhl_scraper(game_ids: list):
                     shot_type = None
                 else:
                     shot_type = play["details"]["shotType"]
+
+                primary_assist_id = None
+                secondary_assist_id = None
+
                 if "assist1PlayerTotal" in play["details"]:
                     primary_assist_id = play["details"]["assist1PlayerId"]
                     if "assist2PlayerId" in play["details"]:
                         secondary_assist_id = play["details"]["assist2PlayerId"]
-                    else:
-                        secondary_assist_id = None
-                else:
-                    primary_assist_id = None
+
                 goals.append(
                     (
                         game,
@@ -1116,7 +1118,7 @@ def add_skaters_on_ice(
 
 def get_toi_df(shifts_df: pd.DataFrame, players_df: pd.DataFrame, teams_df: pd.DataFrame) -> pd.DataFrame:
     players_info = pd.merge(
-        players_df[["player_id", "name", "team"]],  # assuming 'team' here is team_id
+        players_df[["player_id", "name", "team", "position"]],  # assuming 'team' here is team_id
         teams_df[["team_id", "name"]],
         left_on="team",
         right_on="team_id",
@@ -1124,11 +1126,14 @@ def get_toi_df(shifts_df: pd.DataFrame, players_df: pd.DataFrame, teams_df: pd.D
     ).rename(columns={"name_x": "name", "name_y": "team_abbr"})
 
     new_shifts = pd.merge(shifts_df, players_info, on="player_id", how="left")
+    new_shifts["is_home"] = new_shifts["team"].apply(
+        lambda tid: "Home" if tid == shifts_df["home_id"].iloc[0] else "Away"
+    )
 
     new_shifts["duration"] = new_shifts["duration"].fillna("00:00")
     new_shifts["duration"] = new_shifts["duration"].apply(time_to_seconds)
 
-    toi_df = new_shifts.groupby(["name", "team_abbr", "period"])["duration"].sum().reset_index()
+    toi_df = new_shifts.groupby(["name", "team_abbr", "position", "period", "is_home"])["duration"].sum().reset_index()
 
     toi_df["duration_min"] = toi_df["duration"].apply(seconds_to_time)
 
@@ -1167,10 +1172,9 @@ def get_corsi_df(attempts_df: pd.DataFrame, shifts_df: pd.DataFrame) -> pd.DataF
     return corsi_df
 
 def tally_xG(full_df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
-    xG_dict = {
-        "xG_for": defaultdict(float),
-        "xG_against": defaultdict(float)
-    }
+    xG_for = defaultdict(float)
+    xG_against = defaultdict(float)
+    player_home_status = {}
 
     for _, row in full_df.iterrows():
         xg = row["xG"]
@@ -1185,21 +1189,30 @@ def tally_xG(full_df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
             defending_team_players = row['home_players']
 
         for pid in shooting_team_players:
-            xG_dict["xG_for"][(pid, period)] += xg
-        for pid in defending_team_players:
-            xG_dict["xG_against"][(pid, period)] += xg
+            xG_for[(pid, period)] += xg
+            player_home_status[(pid, period)] = is_home_shot
 
-    all_keys = set(xG_dict["xG_for"].keys()) | set(xG_dict["xG_against"].keys())
+        for pid in defending_team_players:
+            xG_against[(pid, period)] += xg
+
+            player_home_status[(pid, period)] = "Home" if is_home_shot == "Away" else "Away"
+
+    all_keys = set(xG_for.keys()) | set(xG_against.keys())
+
     final_df = pd.DataFrame([
         {
             "player_id": pid,
             "period": period,
-            "xG_for": xG_dict["xG_for"].get((pid, period), 0.0),
-            "xG_against": xG_dict["xG_against"].get((pid, period), 0.0)
+            "xG_for": xG_for.get((pid, period), 0.0),
+            "xG_against": xG_against.get((pid, period), 0.0),
+            "is_home": player_home_status.get((pid, period))
         }
         for (pid, period) in all_keys
     ])
-    return pd.merge(final_df, players_df, on="player_id", how="left").sort_values(by=["name", "period"], ascending=[True, True]).reset_index(drop=True)
+
+    final_df = pd.merge(final_df, players_df, on="player_id", how="left")
+    final_df = final_df.sort_values(by=["name", "period"]).reset_index(drop=True)
+    return final_df
 
 def tally_corsi(corsi_df, players_df, game_id):
     client = NHLClient()
@@ -1280,6 +1293,7 @@ def get_box_score_dfs(game_id, players_df: pd.DataFrame, teams_df: pd.DataFrame)
     goalie_rows = []
 
     for player in away_forward_stats:
+        is_home = "Away"
         player_id = player["playerId"]
         goals = player["goals"]
         assists = player["assists"]
@@ -1293,9 +1307,10 @@ def get_box_score_dfs(game_id, players_df: pd.DataFrame, teams_df: pd.DataFrame)
         blocked_shots = player["blockedShots"]
         giveaways = player["giveaways"]
         takeaways = player["takeaways"]
-        skater_rows.append((player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
+        skater_rows.append((is_home, player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
 
     for player in away_defense_stats:
+        is_home = "Away"
         player_id = player["playerId"]
         goals = player["goals"]
         assists = player["assists"]
@@ -1309,16 +1324,18 @@ def get_box_score_dfs(game_id, players_df: pd.DataFrame, teams_df: pd.DataFrame)
         blocked_shots = player["blockedShots"]
         giveaways = player["giveaways"]
         takeaways = player["takeaways"]
-        skater_rows.append((player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
+        skater_rows.append((is_home, player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
 
     for player in away_goalie_stats:
+        is_home = "Away"
         player_id = player["playerId"]
         ga = player["goalsAgainst"]
         sa = player["shotsAgainst"]
         saves = player["saves"]
-        goalie_rows.append((player_id, ga, sa, saves))
+        goalie_rows.append((is_home, player_id, ga, sa, saves))
 
     for player in home_forward_stats:
+        is_home = "Home"
         player_id = player["playerId"]
         goals = player["goals"]
         assists = player["assists"]
@@ -1332,9 +1349,10 @@ def get_box_score_dfs(game_id, players_df: pd.DataFrame, teams_df: pd.DataFrame)
         blocked_shots = player["blockedShots"]
         giveaways = player["giveaways"]
         takeaways = player["takeaways"]
-        skater_rows.append((player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
+        skater_rows.append((is_home, player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
 
     for player in home_defense_stats:
+        is_home = "Home"
         player_id = player["playerId"]
         goals = player["goals"]
         assists = player["assists"]
@@ -1348,17 +1366,18 @@ def get_box_score_dfs(game_id, players_df: pd.DataFrame, teams_df: pd.DataFrame)
         blocked_shots = player["blockedShots"]
         giveaways = player["giveaways"]
         takeaways = player["takeaways"]
-        skater_rows.append((player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
+        skater_rows.append((is_home, player_id, goals, assists, points, plus_minus, pim, hits, pp_goals, sog, fo_pct, blocked_shots, giveaways, takeaways))
 
     for player in home_goalie_stats:
+        is_home = "Home"
         player_id = player["playerId"]
         ga = player["goalsAgainst"]
         sa = player["shotsAgainst"]
         saves = player["saves"]
-        goalie_rows.append((player_id, ga, sa, saves))
+        goalie_rows.append((is_home, player_id, ga, sa, saves))
 
-    skater_h = ["player_id", "goals", "assists", "points", "plus_minus", "pim", "hits", "pp_goals", "sog", "fo_pct", "blocked_shots", "giveaways", "takeaways"]
-    goalie_h = ["player_id", "goals_against", "shots_against", "saves"]
+    skater_h = ["is_home", "player_id", "goals", "assists", "points", "plus_minus", "pim", "hits", "pp_goals", "sog", "fo_pct", "blocked_shots", "giveaways", "takeaways"]
+    goalie_h = ["is_home", "player_id", "goals_against", "shots_against", "saves"]
 
     skater_box_score = pd.DataFrame(skater_rows, columns=skater_h)
     goalie_box_score = pd.DataFrame(goalie_rows, columns=goalie_h)
@@ -1370,8 +1389,31 @@ def get_box_score_dfs(game_id, players_df: pd.DataFrame, teams_df: pd.DataFrame)
 
     return score_df, skater_box_score, goalie_box_score
 
+def copy_to_master_folder(game_id):
+    raw_folder = os.path.join(DATA_DIR, "raw", str(game_id))
+    master_folder = os.path.join(DATA_DIR, "master")
+    os.makedirs(master_folder, exist_ok=True)
+
+    filenames = [
+        "shot_info.csv",
+        "toi_info.csv",
+        "score_info.csv",
+        "skater_box_info.csv",
+        "goalie_box_info.csv",
+        "shot_location_info.csv"
+    ]
+
+    for filename in filenames:
+        src = os.path.join(raw_folder, filename)
+        dst = os.path.join(master_folder, filename)
+        shutil.copy2(src, dst)
+        print(f"Copied {filename} to master folder.")
+
 def get_and_save_data_for_tableau(game_id):
     sys.path.append(os.path.abspath(os.path.join(os.getcwd(), "..")))
+    game_dir = os.path.join(DATA_DIR, str(game_id))
+    os.makedirs(game_dir, exist_ok=True)
+
     shots_df,blocks_df,misses_df,goals_df,_,_,_,_,shifts_df,players_df,_,teams_df = nhl_scraper([game_id])
     model = joblib.load(MODELS_DIR / "xgb_v1.pkl")
 
@@ -1405,29 +1447,46 @@ def get_and_save_data_for_tableau(game_id):
     )
 
     final_df["total_attempts"] = final_df["total_attempts"].fillna(0).astype(int)
-    final_df = final_df.drop(["player_id", "position_x", "position_y", "player_id_y", "name_y", "position", "team", "team_y"], axis=1)
-    final_df.rename(columns={"player_id_x": "player_id", "name_x": "name", "team_x": "team"}, inplace=True)
+    final_df = final_df.drop(["player_id", "position_y", "player_id_y", "name_y", "position", "team", "team_y"], axis=1)
+    final_df.rename(columns={"player_id_x": "player_id", "name_x": "name", "team_x": "team", "position_x": "position"}, inplace=True)
     final_df = pd.merge(final_df, teams_df, left_on="team", right_on="team_id").drop("team", axis=1)
 
-    final_df.to_csv(os.path.join(DATA_DIR, f"{game_id}_shot_info.csv"), index=False)
+    final_df.fillna(0).to_csv(os.path.join(game_dir, f"shot_info.csv"), index=False)
     print("Saved shot_info.csv!")
 
     toi_df = get_toi_df(shifts_df=shifts_df, players_df=players_df, teams_df=teams_df)
-    toi_df.to_csv(os.path.join(DATA_DIR, f"{game_id}_toi_info.csv"), index=False)
+    toi_df.to_csv(os.path.join(game_dir, f"toi_info.csv"), index=False)
     print("Saved toi_info.csv!")
 
     score_df, skater_box_score, goalie_box_score = get_box_score_dfs(game_id=game_id, players_df=players_df, teams_df=teams_df)
 
-    score_df.to_csv(os.path.join(DATA_DIR, f"{game_id}_score_info.csv"), index=False)
+    score_df.to_csv(os.path.join(game_dir, f"score_info.csv"), index=False)
     print("Saved score_info.csv!")
 
-    skater_box_score.to_csv(os.path.join(DATA_DIR, f"{game_id}_skater_box_info.csv"), index=False)
+    skater_box_score.to_csv(os.path.join(game_dir, f"skater_box_info.csv"), index=False)
     print("Saved skater_box_info.csv!")
 
-    goalie_box_score.to_csv(os.path.join(DATA_DIR, f"{game_id}_goalie_box_info.csv"), index=False)
+    goalie_box_score.to_csv(os.path.join(game_dir, f"goalie_box_info.csv"), index=False)
     print("Saved goalie_box_info.csv!")
 
-    full_shots_df.to_csv(os.path.join(DATA_DIR, f"{game_id}_shot_location_info.csv"), index=False)
+    full_shots_df.to_csv(os.path.join(game_dir, f"shot_location_info.csv"), index=False)
     print("Saved shot_location_info.csv!")
+
+    # Create folder for this game's CSVs
+    raw_folder = os.path.join(DATA_DIR, "raw", str(game_id))
+    os.makedirs(raw_folder, exist_ok=True)
+
+    # Save all CSVs to raw_folder
+    final_df.fillna(0).to_csv(os.path.join(raw_folder, "shot_info.csv"), index=False)
+    toi_df.to_csv(os.path.join(raw_folder, "toi_info.csv"), index=False)
+    score_df.to_csv(os.path.join(raw_folder, "score_info.csv"), index=False)
+    skater_box_score.to_csv(os.path.join(raw_folder, "skater_box_info.csv"), index=False)
+    goalie_box_score.to_csv(os.path.join(raw_folder, "goalie_box_info.csv"), index=False)
+    full_shots_df.to_csv(os.path.join(raw_folder, "shot_location_info.csv"), index=False)
+
+    print("Saved all raw CSVs!")
+
+    # Copy to master folder for Tableau
+    copy_to_master_folder(game_id)
 
     return final_df, toi_df, score_df, skater_box_score, goalie_box_score, full_shots_df
